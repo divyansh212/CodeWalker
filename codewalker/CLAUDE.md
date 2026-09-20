@@ -156,35 +156,28 @@ No indexes are declared. Add one on `contributors(repo, author)` when you touch 
 Read this before changing anything in the ingest/roleplay path. These are live bugs,
 not hypotheticals, and every one of them fails silently.
 
-1. **contributor-key-mismatch** — **Contributor key mismatch — breaks the core
-   feature.** `voice_profile` keys authors by `author_login or author_name` (so usually
-   the GitHub login), but `retrieve_context` looks up
-   `ranges[0]["commit"]["author"]["name"]`, which is the git-config display name from
-   GraphQL blame. For any contributor with a linked GitHub account those strings differ,
-   the lookup returns `None`, and `roleplay` runs with `"an unknown contributor"` and no
-   `top_words`. Store both keys on the contributor doc and match on either.
-2. **commits-never-reach-prompts** — **Commit history never reaches a prompt.** Raw
+1. **commits-never-reach-prompts** — **Commit history never reaches a prompt.** Raw
    commit messages are reduced to word counts in `build_voice_profile` and then
    discarded — nothing persists them. `answer` sends only `readme[:3000]` and ignores
    the `blame` and `author_profile` that `retrieve_context` just built. Grounding in
    commits is currently a claim, not a fact.
-3. **immortal-blame-cache** — **Blame cache never invalidates.** Keyed `repo:path` with
+2. **immortal-blame-cache** — **Blame cache never invalidates.** Keyed `repo:path` with
    no SHA and no TTL. Include `last_sha` in the cache key.
-4. **file-pattern-over-matches** — **`FILE_PATTERN` over-matches.** `[\w\-/]+\.\w+`
+3. **file-pattern-over-matches** — **`FILE_PATTERN` over-matches.** `[\w\-/]+\.\w+`
    matches `node.js`, `3.11`, `e.g`, so casual prose sets a bogus `target_path` and
    triggers blame on a path that doesn't exist. Roleplay also requires a filename *and*
    a hint word in the same message, so "why is this function so weird" routes to plain
    Q&A.
-5. **commit-count-double-count** — **`commit_count` double-counts** when `since_sha`
+4. **commit-count-double-count** — **`commit_count` double-counts** when `since_sha`
    falls outside the 5-page fetch window, and repos over ~500 commits are silently
    truncated on first ingest.
-6. **ingest-has-no-heartbeat** — **Ingestion is a FastAPI `BackgroundTask`.** A restart
+5. **ingest-has-no-heartbeat** — **Ingestion is a FastAPI `BackgroundTask`.** A restart
    mid-ingest leaves `status: "ingesting"` forever and the dashboard polls into the
    void.
-7. **tavily-query-is-a-path** — **Tavily query is `f"{target_path} {query}"`** —
+6. **tavily-query-is-a-path** — **Tavily query is `f"{target_path} {query}"`** —
    searching the web for a file path returns noise. Extract library/import names from
    the blamed code instead.
-8. **blame-has-no-code** — **Roleplay reasons about code it has never seen.** GraphQL
+7. **blame-has-no-code** — **Roleplay reasons about code it has never seen.** GraphQL
    blame returns line ranges and commit metadata, never source. `roleplay` therefore
    works from a filename, `top_words`, and three ranges, and describes code nothing in
    the pipeline has read. Delete this entry once file fetching lands.
@@ -249,8 +242,6 @@ wire it to the backend. Live is the real one, posting to `/api/chat`.
 
 In rough order:
 
-- Fix contributor-key-mismatch. The lookup has to resolve before anything built on the
-  author's voice is worth improving.
 - Get commit messages into the prompts (commits-never-reach-prompts).
 - Fetch the file tree and file contents, and stitch them to the blame ranges, so
   roleplay reasons about code it has actually read (blame-has-no-code).
