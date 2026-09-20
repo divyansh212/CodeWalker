@@ -8,6 +8,12 @@ you need side by side:
   2. the author names GraphQL blame actually returns (retrieve_context's key)
   3. whether retrieve_context's lookup resolves      (runs the real node)
 
+Without --path it picks the file itself, walking recently-touched files in a fixed
+order until it finds one whose top blame author was actually ingested. Picking the
+first file the newest commit happened to touch made the exit code depend on that
+commit: land on a file whose top line was last edited by someone outside the
+500-commit window and the run fails with nothing wrong with the lookup.
+
 Usage, from the backend/ directory:
 
     export GITHUB_TOKEN=...
@@ -23,13 +29,23 @@ repos.
 Mongo comes from your normal .env (MONGODB_URI / MONGODB_DB), so run this from
 backend/ where that file lives. It writes to the same collections the app uses.
 
-Exit code is 1 if the lookup fails to resolve, 0 if it works.
+Exit codes:
+
+  0  the lookup resolved
+  1  the lookup is broken -- contributor-key-mismatch, or a regression of it
+  2  nothing could be tested: no token, no blame ranges, or no candidate file whose
+     top blame author was ingested at all
+
+Exit 1 means the lookup is broken and nothing else. An author who never entered the
+ingest window has no contributor doc under any key, so that file cannot exercise the
+lookup either way -- that is a 2.
 """
 
 import argparse
 import asyncio
 import os
 import sys
+import traceback
 from pathlib import Path
 
 import httpx
@@ -44,6 +60,12 @@ from app.config import get_settings  # noqa: E402
 from app.db import get_db  # noqa: E402
 from app.services.github_client import GitHubClient  # noqa: E402
 from app.services.ingestion import ingest_repo  # noqa: E402
+
+
+# Caps on the candidate walk: enough files to get past a docs-only commit, few
+# enough that a bad repo cannot fire off dozens of blame queries.
+MAX_CANDIDATE_COMMITS = 5
+MAX_CANDIDATE_FILES = 20
 
 
 def rule(title: str) -> None:
@@ -73,34 +95,84 @@ def resolve_token(flag: str = "") -> str:
     return from_file.strip()
 
 
-async def pick_path(client: GitHubClient, owner: str, repo: str, sha: str) -> str:
-    """Default to a file the newest commit actually touched, so blame is non-empty."""
-    async with httpx.AsyncClient() as http:
-        resp = await http.get(
-            f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}",
-            headers=client.headers,
-        )
-        resp.raise_for_status()
-        files = resp.json().get("files") or []
+async def candidate_paths(client: GitHubClient, owner: str, repo: str, commits: list) -> list:
+    """Recently touched files: newest commit first, filenames sorted within each.
 
-    for f in files:
-        if f.get("status") != "removed" and f.get("filename"):
-            return f["filename"]
-    return "README.md"
+    Sorted so the pick does not depend on the order the API happens to list files in.
+    Two caps keep this from turning into a blame-call spree on a big merge.
+    """
+    paths: list = []
+    async with httpx.AsyncClient() as http:
+        for c in commits[:MAX_CANDIDATE_COMMITS]:
+            resp = await http.get(
+                f"https://api.github.com/repos/{owner}/{repo}/commits/{c['sha']}",
+                headers=client.headers,
+            )
+            if resp.status_code != 200:
+                continue
+            files = resp.json().get("files") or []
+            for f in sorted(files, key=lambda f: f.get("filename") or ""):
+                if f.get("status") == "removed" or not f.get("filename"):
+                    continue
+                if f["filename"] not in paths:
+                    paths.append(f["filename"])
+                    if len(paths) >= MAX_CANDIDATE_FILES:
+                        return paths
+    return paths
+
+
+async def pick_path(
+    client: GitHubClient, owner: str, repo: str, commits: list, branch: str, ingested: set
+) -> tuple:
+    """First candidate file whose ranges[0] author was actually ingested.
+
+    `ingested` comes from the commit window itself, not from the contributor docs'
+    key fields -- selecting on the keys the lookup matches on would let the lookup
+    pick its own exam questions, and a file it cannot resolve would be quietly
+    skipped instead of failing.
+
+    Returns (path, ranges) so the caller does not blame the same file twice, or
+    (None, None) when no candidate can exercise the lookup.
+    """
+    failures = 0
+    for path in await candidate_paths(client, owner, repo, commits):
+        try:
+            ranges = await client.get_blame(owner, repo, path, branch=branch)
+        except httpx.HTTPError as exc:
+            # Blame on a very large file outruns httpx's default timeout. That is a
+            # failure to ask the question, not an answer -- try the next candidate.
+            failures += 1
+            print(f"  skip  {short(path, 40):<40} blame failed: {type(exc).__name__}")
+            continue
+        if not ranges:
+            continue
+        author = ranges[0]["commit"]["author"]["name"]
+        if author in ingested:
+            return path, ranges
+        print(f"  skip  {short(path, 40):<40} ranges[0] '{short(author, 18)}' not ingested")
+    if failures:
+        print(f"  ({failures} candidate(s) skipped because blame itself failed)")
+    return None, None
 
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke-test ingest + contributor lookup.")
     parser.add_argument("repo", help="owner/name, e.g. encode/httpx")
-    parser.add_argument("--path", help="file to blame (default: a file from the newest commit)")
+    parser.add_argument(
+        "--path",
+        help="file to blame (default: the first recently-touched file whose top blame "
+             "author was ingested)",
+    )
     # Undocumented override. Prefer GITHUB_TOKEN: an argv flag lands in shell
     # history and in ps output for every user on the box.
     parser.add_argument("--token", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="drop this repo's contributors + blame_cache first (blame_cache never "
-             "invalidates on its own -- the immortal-blame-cache trap)",
+        help="drop this repo's repos doc, contributors and blame_cache first. The "
+             "repos doc goes too: a surviving last_sha makes the next ingest "
+             "incremental, so it fetches no commits and rebuilds no contributors. "
+             "blame_cache never invalidates on its own -- the immortal-blame-cache trap",
     )
     args = parser.parse_args()
 
@@ -127,11 +199,17 @@ async def main() -> int:
     print(f"mongo  {settings.mongodb_db} on {short(settings.mongodb_uri.split('@')[-1], 40)}")
 
     if args.fresh:
+        # The repos doc has to go as well. Leaving it keeps last_sha, which sends the
+        # next ingest down the incremental path: it fetches zero commits, rebuilds
+        # zero contributors, and the empty collection reads exactly like a broken
+        # lookup.
+        gone_r = (await db.repos.delete_one({"_id": repo_key})).deleted_count
         gone_c = (await db.contributors.delete_many({"repo": repo_key})).deleted_count
         gone_b = (await db.blame_cache.delete_many(
             {"_id": {"$regex": f"^{repo_key}:"}}
         )).deleted_count
-        print(f"fresh  cleared {gone_c} contributors, {gone_b} blame_cache entries")
+        print(f"fresh  cleared {gone_r} repo doc, {gone_c} contributors, "
+              f"{gone_b} blame_cache entries")
 
     rule("1. ingest")
     await ingest_repo(token, owner, name)
@@ -142,13 +220,28 @@ async def main() -> int:
     print(f"readme          {len(repo_doc.get('readme') or '')} chars")
 
     client = GitHubClient(token)
-    last_sha = repo_doc.get("last_sha")
+    branch = repo_doc.get("default_branch", "main")
+    # Fetched once, reused by path selection and by section 4's login mapping.
+    commits = await client.get_commits(owner, name)
+    ingested = {c["author_name"] for c in commits if c.get("author_name")}
+    ingested |= {c["author_login"] for c in commits if c.get("author_login")}
+
+    preblamed = None
     if args.path:
         path = args.path
-    elif last_sha:
-        path = await pick_path(client, owner, name, last_sha)
     else:
-        path = "README.md"
+        path, preblamed = await pick_path(client, owner, name, commits, branch, ingested)
+        if path is None:
+            print(
+                "no testable file found in the ingest window -- every candidate file was "
+                "either\nblamed to an author outside the ingested commits (no contributor "
+                "doc under any\nkey, so the lookup cannot be exercised either way) or "
+                "could not be blamed at all.\nTry --fresh (an incremental ingest fetches "
+                "no commits), --path with a recently\ntouched file, or a repo whose "
+                "history fits the window.",
+                file=sys.stderr,
+            )
+            return 2
     print(f"file under test  {path}")
 
     rule("2. contributor keys in Mongo (what voice_profile stored)")
@@ -162,7 +255,9 @@ async def main() -> int:
         print(f"  ... and {len(stored) - 10} more")
 
     rule("3. author names from GraphQL blame (what retrieve_context looks up)")
-    ranges = await client.get_blame(owner, name, path, branch=repo_doc.get("default_branch", "main"))
+    ranges = preblamed if preblamed is not None else await client.get_blame(
+        owner, name, path, branch=branch
+    )
     if not ranges:
         print(f"no blame ranges for {path} -- wrong path or empty file, nothing to compare")
         return 2
@@ -178,7 +273,6 @@ async def main() -> int:
 
     rule("4. are these the same people? (login vs git display name)")
     # Commits carry both keys, so we can prove the two lists describe one person.
-    commits = await client.get_commits(owner, name)
     name_to_login = {}
     for c in commits:
         if c.get("author_name") and c.get("author_login"):
@@ -226,3 +320,9 @@ if __name__ == "__main__":
         raise SystemExit(asyncio.run(main()))
     except KeyboardInterrupt:
         raise SystemExit(130)
+    except Exception:
+        # Anything unhandled is a run that broke, not a lookup that broke. Python
+        # would exit 1 here, and exit 1 has to keep meaning one thing.
+        traceback.print_exc()
+        print("\nrun failed before it could test the lookup", file=sys.stderr)
+        raise SystemExit(2)
