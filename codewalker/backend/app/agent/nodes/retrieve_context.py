@@ -15,8 +15,17 @@ async def retrieve_context(state: AgentState) -> AgentState:
         ranges = await get_or_fetch_blame(state["token"], state["repo_owner"], state["repo_name"], path)
         context["blame"] = ranges
         if ranges:
+            # Blame gives the git display name; ingest keys contributors on the GitHub
+            # login. They differ for anyone with a linked account, so match on either.
             author = ranges[0]["commit"]["author"]["name"]
-            profile = await db.contributors.find_one({"repo": repo_key, "author": author})
+            profile = await db.contributors.find_one({
+                "repo": repo_key,
+                "$or": [
+                    {"author": author},
+                    {"author_login": author},
+                    {"author_names": author},
+                ],
+            })
             context["author_profile"] = profile
 
     state["context"] = context
