@@ -5,10 +5,11 @@ Guidance for Claude Code when working in this repo.
 ## What this is
 
 Penguin (internal name: Codewalker) is an agent that reads a GitHub repo the way a
-new hire would — README first, then commit log, then `git blame` per file — builds a
-rough "voice profile" for each contributor from their commit style, and then, when
-asked about confusing legacy code, **roleplays in first person as the inferred author**,
-reasoning through why they probably wrote it that way. Half debugging tool, half seance.
+new hire would — README first, then commit log, then the file tree, then the source
+itself with `git blame` per file — builds a rough "voice profile" for each contributor
+from their commit style, and then, when asked about confusing legacy code, **roleplays
+in first person as the inferred author**, reasoning through why they probably wrote it
+that way. Half debugging tool, half seance.
 
 Secondary feature: open-source onboarding for people who have never opened a PR —
 find a good-fit repo, surface `good first issue` candidates, and walk them through a
@@ -23,6 +24,12 @@ any user-facing copy.
 bot. If a change makes `roleplay` output drift toward third-person description
 ("the author probably wanted to…"), that change is wrong. First person, in character,
 no breaking frame, no meta-commentary about being an AI.
+
+Reading the source makes this harder to hold, not easier. Plain code explanation is now
+the easy output, so the roleplay register is the thing that erodes: the failure mode is
+no longer a generic answer, it is a competent line-by-line walkthrough that has stopped
+being anybody's voice. Explaining the code is the floor. The product is the author's
+reasoning about why it is that way.
 
 Keep the `roleplay` and `answer` system prompts in separate files so the persona can
 be iterated on without touching the plain path. They are currently module-level
@@ -133,8 +140,14 @@ the matching contributor profile.
 - `contributors` — one doc per `(repo, author)` with commit count, avg message length,
   `top_words`, first/last commit dates.
 - `blame_cache` — `_id` is `"owner/name:path"`, holds GraphQL blame ranges.
+- `file_tree` — one doc per repo, keyed to a commit SHA. The recursive tree from
+  `/git/trees?recursive=1`.
+- `file_cache` — one doc per `(repo, path, SHA)`. File bodies from `/contents/{path}`.
 - `sessions` / `messages` — **specified but not implemented.** `/api/chat` is stateless.
 - `oss_recommendations` — specified, not implemented.
+
+`file_tree` and `file_cache` carry the SHA in their key, so both fall out of use on
+their own when the repo moves. `blame_cache` does not — see immortal-blame-cache.
 
 No indexes are declared. Add one on `contributors(repo, author)` when you touch it.
 
@@ -171,6 +184,10 @@ not hypotheticals, and every one of them fails silently.
 7. **tavily-query-is-a-path** — **Tavily query is `f"{target_path} {query}"`** —
    searching the web for a file path returns noise. Extract library/import names from
    the blamed code instead.
+8. **blame-has-no-code** — **Roleplay reasons about code it has never seen.** GraphQL
+   blame returns line ranges and commit metadata, never source. `roleplay` therefore
+   works from a filename, `top_words`, and three ranges, and describes code nothing in
+   the pipeline has read. Delete this entry once file fetching lands.
 
 ## Security debt
 
@@ -230,10 +247,22 @@ wire it to the backend. Live is the real one, posting to `/api/chat`.
 
 ## What's next
 
-In rough order: fix the contributor key mismatch and get commits into the prompts;
-SSE streaming on `/api/chat` so the terminal types a real response token by token;
-a file browser in the dashboard so `target_path` stops being a regex guess; chat history
-(`sessions`/`messages`); deploy (backend Docker -> AWS free tier, frontend -> Vercel).
+In rough order:
+
+- Fix contributor-key-mismatch. The lookup has to resolve before anything built on the
+  author's voice is worth improving.
+- Get commit messages into the prompts (commits-never-reach-prompts).
+- Fetch the file tree and file contents, and stitch them to the blame ranges, so
+  roleplay reasons about code it has actually read (blame-has-no-code).
+- Repo briefing on ingest — an orientation pass over the repo once it is ready.
+- SSE streaming on `/api/chat` so the terminal types a real response token by token.
+- Repo-scoped issue suggestions.
+- Voice input via Groq Whisper.
+- `oss_finder` with real user context.
+
+Then chat history (`sessions`/`messages`), a dashboard file browser so `target_path`
+stops being a regex guess, and deploy (backend Docker -> AWS free tier, frontend ->
+Vercel).
 
 One practical note: pointed at itself this repo has one author and one commit, so it
 cannot demo its own feature. Keep a messy long-history public repo on hand for testing.
