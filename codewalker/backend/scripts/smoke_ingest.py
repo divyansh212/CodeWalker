@@ -248,9 +248,14 @@ async def main() -> int:
     stored = await db.contributors.find({"repo": repo_key}).to_list(length=None)
     stored_keys = {c["author"] for c in stored}
     print(f"{len(stored)} contributor docs")
+    # msgs is informational only -- it is how many raw commit messages ingest kept for
+    # this contributor, which is what reaches the prompts. It does not affect the exit
+    # code; scripts/smoke_prompts.py is what actually asserts on that.
     for c in sorted(stored, key=lambda c: -c.get("commit_count", 0))[:10]:
         words = ", ".join(c.get("top_words", [])[:4])
-        print(f"  {short(c['author'], 28):<28} {c.get('commit_count', 0):>4} commits  [{words}]")
+        msgs = len(c.get("recent_messages") or [])
+        print(f"  {short(c['author'], 24):<24} {c.get('commit_count', 0):>4} commits  "
+              f"{msgs:>2} msgs  [{words}]")
     if len(stored) > 10:
         print(f"  ... and {len(stored) - 10} more")
 

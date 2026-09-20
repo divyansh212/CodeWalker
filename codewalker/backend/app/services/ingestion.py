@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from app.services.github_client import GitHubClient
-from app.services.voice_profile import build_voice_profile
+from app.services.voice_profile import build_voice_profile, merge_recent_messages
 from app.db import get_db
 
 
@@ -27,12 +27,7 @@ async def ingest_repo(token: str, owner: str, repo: str):
         commits = await client.get_commits(owner, repo, since_sha=since_sha)
 
         profiles = build_voice_profile(commits)
-        for author, profile in profiles.items():
-            await db.contributors.update_one(
-                {"repo": repo_key, "author": author},
-                {"$set": {**profile, "repo": repo_key}},
-                upsert=True,
-            )
+        await persist_voice_profiles(db, repo_key, profiles)
 
         prior_count = existing.get("commit_count", 0) if existing else 0
         await db.repos.update_one(
@@ -54,6 +49,28 @@ async def ingest_repo(token: str, owner: str, repo: str):
             upsert=True,
         )
         raise
+
+
+async def persist_voice_profiles(db, repo_key: str, profiles: dict) -> None:
+    """Upsert one contributor doc per author, merging stored commit messages.
+
+    Everything else in the profile is recomputed from scratch each run and can be
+    overwritten, but recent_messages is cumulative: on an incremental ingest the
+    profile was built from only the newly fetched commits, so a blind $set would
+    throw away everything stored on previous runs.
+    """
+    for author, profile in profiles.items():
+        query = {"repo": repo_key, "author": author}
+        stored = await db.contributors.find_one(query, {"recent_messages": 1})
+        merged = merge_recent_messages(
+            (stored or {}).get("recent_messages") or [],
+            profile.get("recent_messages") or [],
+        )
+        await db.contributors.update_one(
+            query,
+            {"$set": {**profile, "recent_messages": merged, "repo": repo_key}},
+            upsert=True,
+        )
 
 
 async def get_or_fetch_blame(token: str, owner: str, repo: str, path: str) -> list:
