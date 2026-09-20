@@ -27,6 +27,10 @@ async def retrieve_context(state: AgentState) -> AgentState:
                 ],
             })
             context["author_profile"] = profile
+            # The author's own commit messages, stored on the contributor doc by
+            # ingest. Lifted out under their own key so roleplay and answer do not
+            # have to know where inside the profile they live.
+            context["author_commits"] = (profile or {}).get("recent_messages") or []
 
     state["context"] = context
     return state

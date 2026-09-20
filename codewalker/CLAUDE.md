@@ -62,6 +62,7 @@ codewalker/
       api/                  routes_auth, routes_repos, routes_chat (all under /api)
     scripts/
       smoke_ingest.py       ingest -> blame -> lookup check, see Commands
+      smoke_prompts.py      asserts commit text reaches both prompts, see Commands
   frontend/
     app/page.tsx            landing page
     app/login/page.tsx      OAuth entry
@@ -82,6 +83,10 @@ cd frontend && npm install && npm run dev
 # verify the ingest path against a real public repo (run from backend/)
 export GITHUB_TOKEN=...          # or put it in .env; never pass it as an argv flag
 python scripts/smoke_ingest.py encode/httpx --fresh
+
+# verify commit text still reaches the prompts (no token or API keys needed)
+python scripts/smoke_prompts.py
+python scripts/smoke_prompts.py --live encode/httpx    # same, via a real ingest
 ```
 
 `scripts/smoke_ingest.py` is the verification step for any change to ingest, blame, or
@@ -101,6 +106,18 @@ can report a healthier result than the code deserves. A token is required, since
 GraphQL blame rejects anonymous calls — set `GITHUB_TOKEN` in your environment or
 `.env`; `--token` exists as an override but keeps a live token in shell history and
 `ps` output, so prefer the env var.
+
+`scripts/smoke_prompts.py` is the verification step for any change to what goes *into*
+a prompt. `smoke_ingest.py` stops at proving the contributor lookup resolves; this one
+stubs `chat_completion`, runs the real `retrieve_context`, `roleplay` and `answer`
+nodes, and asserts that sentinel commit text is present in the strings both nodes would
+have sent. Default mode seeds synthetic commits through the real `build_voice_profile`
+and `persist_voice_profiles` under a throwaway repo key with a pre-seeded `blame_cache`
+entry, so it needs no GitHub token and no Groq or Tavily key, and it deletes its own
+fixtures on the way out. `--live owner/name` runs the same assertions through a real
+ingest, which is the only way to catch ingest failing to persist the messages at all.
+`--show` prints both prompts in full. Exit **0** reached both prompts, **1** did not
+(the missing sentinel and the offending prompt are printed), **2** could not test.
 
 There is no unit test suite yet. If you add one, pytest for the backend.
 
@@ -141,7 +158,13 @@ the matching contributor profile.
 - `repos` — `_id` is `"owner/name"`. Holds `status` (`ingesting` | `ready` | `error`),
   `readme` (truncated to 20k), `default_branch`, `last_sha`, `commit_count`.
 - `contributors` — one doc per `(repo, author)` with commit count, avg message length,
-  `top_words`, first/last commit dates.
+  `top_words`, first/last commit dates, and `recent_messages`: the raw commit messages
+  themselves, newest first, deduped by sha and capped at 20 per contributor with each
+  truncated to 600 chars. Capped per *contributor*, not per repo, so the cost does not
+  scale with a 500-commit ingest. They live here rather than in a `commits` collection
+  so they ride along with the author lookup that already reconciles login vs display
+  name — see `merge_recent_messages`, which exists because an incremental ingest only
+  ever sees the new commits and a blind `$set` would evict everything stored before.
 - `blame_cache` — `_id` is `"owner/name:path"`, holds GraphQL blame ranges.
 - `file_tree` — one doc per repo, keyed to a commit SHA. The recursive tree from
   `/git/trees?recursive=1`.
@@ -159,31 +182,27 @@ No indexes are declared. Add one on `contributors(repo, author)` when you touch 
 Read this before changing anything in the ingest/roleplay path. These are live bugs,
 not hypotheticals, and every one of them fails silently.
 
-1. **commits-never-reach-prompts** — **Commit history never reaches a prompt.** Raw
-   commit messages are reduced to word counts in `build_voice_profile` and then
-   discarded — nothing persists them. `answer` sends only `readme[:3000]` and ignores
-   the `blame` and `author_profile` that `retrieve_context` just built. Grounding in
-   commits is currently a claim, not a fact.
-2. **immortal-blame-cache** — **Blame cache never invalidates.** Keyed `repo:path` with
+1. **immortal-blame-cache** — **Blame cache never invalidates.** Keyed `repo:path` with
    no SHA and no TTL. Include `last_sha` in the cache key.
-3. **file-pattern-over-matches** — **`FILE_PATTERN` over-matches.** `[\w\-/]+\.\w+`
+2. **file-pattern-over-matches** — **`FILE_PATTERN` over-matches.** `[\w\-/]+\.\w+`
    matches `node.js`, `3.11`, `e.g`, so casual prose sets a bogus `target_path` and
    triggers blame on a path that doesn't exist. Roleplay also requires a filename *and*
    a hint word in the same message, so "why is this function so weird" routes to plain
    Q&A.
-4. **commit-count-double-count** — **`commit_count` double-counts** when `since_sha`
+3. **commit-count-double-count** — **`commit_count` double-counts** when `since_sha`
    falls outside the 5-page fetch window, and repos over ~500 commits are silently
    truncated on first ingest.
-5. **ingest-has-no-heartbeat** — **Ingestion is a FastAPI `BackgroundTask`.** A restart
+4. **ingest-has-no-heartbeat** — **Ingestion is a FastAPI `BackgroundTask`.** A restart
    mid-ingest leaves `status: "ingesting"` forever and the dashboard polls into the
    void.
-6. **tavily-query-is-a-path** — **Tavily query is `f"{target_path} {query}"`** —
+5. **tavily-query-is-a-path** — **Tavily query is `f"{target_path} {query}"`** —
    searching the web for a file path returns noise. Extract library/import names from
    the blamed code instead.
-7. **blame-has-no-code** — **Roleplay reasons about code it has never seen.** GraphQL
-   blame returns line ranges and commit metadata, never source. `roleplay` therefore
-   works from a filename, `top_words`, and three ranges, and describes code nothing in
-   the pipeline has read. Delete this entry once file fetching lands.
+6. **blame-has-no-code** — **Roleplay reasons about code it has never seen.** GraphQL
+   blame returns line ranges and commit metadata, never source. `roleplay` now has the
+   author's real commit messages, but still no source — it works from a filename, three
+   ranges, and what the author said they were doing, and describes code nothing in the
+   pipeline has read. Delete this entry once file fetching lands.
 
 ## Security debt
 
@@ -245,7 +264,6 @@ wire it to the backend. Live is the real one, posting to `/api/chat`.
 
 In rough order:
 
-- Get commit messages into the prompts (commits-never-reach-prompts).
 - Fetch the file tree and file contents, and stitch them to the blame ranges, so
   roleplay reasons about code it has actually read (blame-has-no-code).
 - Repo briefing on ingest — an orientation pass over the repo once it is ready.
