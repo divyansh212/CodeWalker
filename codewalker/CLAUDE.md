@@ -165,6 +165,10 @@ the matching contributor profile.
   so they ride along with the author lookup that already reconciles login vs display
   name — see `merge_recent_messages`, which exists because an incremental ingest only
   ever sees the new commits and a blind `$set` would evict everything stored before.
+  `commit_count` is cumulative for the same reason and merged the same way, but a
+  running total carries no shas to dedupe against, so `last_counted_sha` holds the
+  newest sha counted and the next run counts only what sits above it — see
+  `merge_commit_count`, and commit-count-double-count for the case it cannot cover.
 - `blame_cache` — `_id` is `"owner/name:path"`, holds GraphQL blame ranges.
 - `file_tree` — one doc per repo, keyed to a commit SHA. The recursive tree from
   `/git/trees?recursive=1`.
@@ -189,9 +193,13 @@ not hypotheticals, and every one of them fails silently.
    triggers blame on a path that doesn't exist. Roleplay also requires a filename *and*
    a hint word in the same message, so "why is this function so weird" routes to plain
    Q&A.
-3. **commit-count-double-count** — **`commit_count` double-counts** when `since_sha`
-   falls outside the 5-page fetch window, and repos over ~500 commits are silently
-   truncated on first ingest.
+3. **commit-count-double-count** — **`repos.commit_count` double-counts** when
+   `since_sha` falls outside the 5-page fetch window: `prior_count + len(commits)`
+   adds commits that were already counted. `contributors.commit_count` no longer has
+   this bug — it counts from `last_counted_sha` — but it still over-reports the one
+   case that boundary cannot see, an author who landed more than a full fetch window
+   since the last run. Both need the window lifted, not another guess at the total.
+   Repos over ~500 commits are still silently truncated on first ingest.
 4. **ingest-has-no-heartbeat** — **Ingestion is a FastAPI `BackgroundTask`.** A restart
    mid-ingest leaves `status: "ingesting"` forever and the dashboard polls into the
    void.

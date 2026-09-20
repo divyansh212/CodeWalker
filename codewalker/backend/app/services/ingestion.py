@@ -1,6 +1,11 @@
 from datetime import datetime, timezone
 from app.services.github_client import GitHubClient
-from app.services.voice_profile import build_voice_profile, merge_recent_messages
+from app.services.voice_profile import (
+    WINDOW_SHAS_KEY,
+    build_voice_profile,
+    merge_commit_count,
+    merge_recent_messages,
+)
 from app.db import get_db
 
 
@@ -52,23 +57,41 @@ async def ingest_repo(token: str, owner: str, repo: str):
 
 
 async def persist_voice_profiles(db, repo_key: str, profiles: dict) -> None:
-    """Upsert one contributor doc per author, merging stored commit messages.
+    """Upsert one contributor doc per author, merging the cumulative fields.
 
-    Everything else in the profile is recomputed from scratch each run and can be
-    overwritten, but recent_messages is cumulative: on an incremental ingest the
-    profile was built from only the newly fetched commits, so a blind $set would
-    throw away everything stored on previous runs.
+    Most of the profile is recomputed from scratch each run and can be overwritten.
+    recent_messages and commit_count cannot: on an incremental ingest the profile was
+    built from only the newly fetched commits, so a blind $set throws away the stored
+    messages and walks the total back down to the size of this run's window. Both are
+    merged against what is stored, messages deduped by sha and the count taken from
+    the shas above the last one counted.
     """
     for author, profile in profiles.items():
         query = {"repo": repo_key, "author": author}
-        stored = await db.contributors.find_one(query, {"recent_messages": 1})
+        stored = await db.contributors.find_one(
+            query, {"recent_messages": 1, "commit_count": 1, "last_counted_sha": 1}
+        )
         merged = merge_recent_messages(
             (stored or {}).get("recent_messages") or [],
             profile.get("recent_messages") or [],
         )
+        count, boundary = merge_commit_count(
+            (stored or {}).get("commit_count") or 0,
+            (stored or {}).get("last_counted_sha"),
+            profile.get(WINDOW_SHAS_KEY) or [],
+        )
+        # The sha list is an input to that merge, not part of the doc. Filtered rather
+        # than popped so this does not mutate the caller's profiles.
+        doc = {k: v for k, v in profile.items() if k != WINDOW_SHAS_KEY}
         await db.contributors.update_one(
             query,
-            {"$set": {**profile, "recent_messages": merged, "repo": repo_key}},
+            {"$set": {
+                **doc,
+                "recent_messages": merged,
+                "commit_count": count,
+                "last_counted_sha": boundary,
+                "repo": repo_key,
+            }},
             upsert=True,
         )
 

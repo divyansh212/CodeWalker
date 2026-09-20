@@ -56,6 +56,44 @@ def merge_recent_messages(existing: list, incoming: list, cap: int = RECENT_MESS
     return sorted(merged.values(), key=_date_of, reverse=True)[:cap]
 
 
+# This run's commit shas for one author, newest first. Carried on the profile so
+# persist_voice_profiles can tell which of them were already counted, and dropped
+# before the doc is written -- the stored field is last_counted_sha, not the list.
+WINDOW_SHAS_KEY = "window_shas"
+
+
+def merge_commit_count(stored_count: int, boundary_sha, window_shas: list) -> tuple:
+    """(count, new_boundary_sha), counting only commits not already counted.
+
+    commit_count has the same problem recent_messages does -- the profile is built
+    from just the commits fetched on this run, so a blind $set walks the total back
+    down to the size of the latest window -- but it cannot be fixed the same way,
+    because a running total carries no shas to dedupe against. So store the newest
+    sha counted and, on the next run, count only what sits above it.
+
+    A plain stored_count + len(window) would fix the decay and introduce
+    commit-count-double-count in its place: when since_sha falls outside the fetch
+    window, get_commits returns commits that were already counted, and adding them
+    again inflates the total silently. Stopping at the boundary makes that case
+    correct rather than merely different.
+
+    The boundary can still fall outside the window, if this author landed more than
+    the fetch window's worth of commits since the last run. Nothing in the window
+    then says what was already counted, so it counts everything and over-reports --
+    the residual half of commit-count-double-count, and it needs the fetch window
+    lifted rather than another guess here.
+    """
+    if not window_shas:
+        return stored_count, boundary_sha
+    newest = window_shas[0]
+    if boundary_sha is None:
+        return len(window_shas), newest
+    if boundary_sha in window_shas:
+        # Everything above the boundary is new; the boundary and below were counted.
+        return stored_count + window_shas.index(boundary_sha), newest
+    return stored_count + len(window_shas), newest
+
+
 def format_messages_for_prompt(messages: list, limit: int) -> str:
     """Commit messages verbatim, newest first, one dated block each.
 
@@ -104,6 +142,7 @@ def build_voice_profile(commits: list) -> dict:
             "author": author,
             "author_login": login,
             "author_names": names,
+            # This window only. persist_voice_profiles merges it into the total.
             "commit_count": len(author_commits),
             "avg_message_length": round(avg_len, 1),
             "top_words": [w for w, _ in word_counts.most_common(8)],
@@ -111,6 +150,8 @@ def build_voice_profile(commits: list) -> dict:
             # doc rather than a commits collection so they ride along with the
             # contributor lookup that already resolves login vs display name.
             "recent_messages": recent_messages(author_commits),
+            # Transient: consumed by persist_voice_profiles, never stored.
+            WINDOW_SHAS_KEY: [c["sha"] for c in author_commits if c.get("sha")],
             "first_commit": dates[0],
             "last_commit": dates[-1],
         }
