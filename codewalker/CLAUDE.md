@@ -85,12 +85,15 @@ python scripts/smoke_ingest.py encode/httpx --fresh
 ```
 
 `scripts/smoke_ingest.py` is the verification step for any change to ingest, blame, or
-contributor lookup. It ingests a real public repo, picks one file, and prints the
-contributor keys stored in Mongo beside the author names GraphQL blame returns — then
-runs the actual `retrieve_context` node and reports whether the lookup resolves. It
-**exits 1 when the lookup fails**, so it doubles as a before/after check on
-contributor-key-mismatch: a passing run is the evidence the fix landed, and a failing
-one reproduces the bug with the wanted key and the available keys printed side by side.
+contributor lookup. It ingests a real public repo, picks a file whose top blame author
+was actually ingested, and prints the contributor keys stored in Mongo beside the author
+names GraphQL blame returns — then runs the actual `retrieve_context` node and reports
+whether the lookup resolves. Exit **0** means it resolved; **1** means the lookup is
+broken, with the wanted key and the available keys printed side by side; **2** means the
+run could not test the lookup at all — no token, no blame ranges, or no candidate file
+whose blamed author was inside the ingest window. Exit 1 is reserved for a broken lookup
+and nothing else, so it is worth trusting as a before/after check whenever you change how
+contributors are keyed or looked up.
 
 Pass `--fresh` unless you specifically want cached state. `blame_cache` never
 invalidates (immortal-blame-cache), so a second run without it reads stale ranges and
